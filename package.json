@@ -1,0 +1,30 @@
+{
+  "name": "botever",
+  "version": "1.0.0",
+  "description": "Modular Discord Bot",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "NODE_ENV=production node dist/index.js",
+    "dev": "NODE_ENV=development nodemon --exec tsx src/index.ts",
+    "deploy:dev": "NODE_ENV=development tsx src/deploy-commands.ts",
+    "deploy:prod": "NODE_ENV=production tsx src/deploy-commands.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@discordjs/rest": "^2.6.3",
+    "@supabase/supabase-js": "^2.112.3",
+    "discord-api-types": "^0.38.53",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "nodemon": "^3.1.14",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

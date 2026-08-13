@@ -1,0 +1,16 @@
+node_modules/
+dist/
+
+# Environment (enthält Tokens und Keys — niemals committen)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
