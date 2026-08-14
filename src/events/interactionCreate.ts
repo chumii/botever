@@ -6,7 +6,7 @@ module.exports = {
   async execute(interaction: Interaction) {
     const client = interaction.client as BotClient;
 
-    if (interaction.isChatInputCommand()) {
+    if (interaction.isChatInputCommand() || interaction.isUserContextMenuCommand()) {
       const command = client.commands.get(interaction.commandName);
       if (!command) { console.error(`Unbekannter Command: ${interaction.commandName}`); return; }
       try {

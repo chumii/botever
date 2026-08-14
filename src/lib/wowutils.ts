@@ -79,6 +79,48 @@ export async function getRoster(): Promise<RosterMember[]> {
   return members;
 }
 
+export type RosterRank = 'GM' | 'Officer' | 'Raider' | 'Trial' | 'Social';
+export type MainRole = 'tank' | 'healer' | 'melee' | 'ranged';
+
+export interface RosterWriteFields {
+  displayName?: string;
+  rank?: RosterRank;
+  mainRole?: MainRole;
+  /** "" löscht den Battletag; undefined lässt ihn unverändert. */
+  battletag?: string;
+  character?: { name: string; realm: string };
+}
+
+// Der Charakter muss WoWUtils bereits aus dem verknüpften Gilden-Sync bekannt
+// sein — Klasse und Spec kommen von dort. Ein unbekannter Charakter liefert
+// einen 400 mit Klartext-Namen im Fehlertext, der 1:1 an den Officer geht.
+export async function addRosterMember(fields: RosterWriteFields & { displayName: string }): Promise<{ memberId: string }> {
+  const groupId = await getGroupId();
+  const body: Record<string, unknown> = { displayName: fields.displayName };
+  if (fields.rank) body.rank = fields.rank;
+  if (fields.mainRole) body.mainRole = fields.mainRole;
+  if (fields.battletag) body.battletag = fields.battletag;
+  if (fields.character) body.characters = [{ name: fields.character.name, realm: fields.character.realm }];
+  const result = await api<{ memberId: string }>(`/v1/groups/${groupId}/roster/members`, { method: 'POST', body: JSON.stringify(body) });
+  return result;
+}
+
+export async function updateRosterMember(memberId: string, fields: RosterWriteFields): Promise<void> {
+  const groupId = await getGroupId();
+  const body: Record<string, unknown> = {};
+  if (fields.displayName) body.displayName = fields.displayName;
+  if (fields.rank) body.rank = fields.rank;
+  if (fields.mainRole) body.mainRole = fields.mainRole;
+  if (fields.battletag !== undefined) body.battletag = fields.battletag;
+  if (fields.character) body.characters = [{ name: fields.character.name, realm: fields.character.realm }];
+  await api(`/v1/groups/${groupId}/roster/members/${memberId}`, { method: 'PUT', body: JSON.stringify(body) });
+}
+
+export async function removeRosterMember(memberId: string): Promise<void> {
+  const groupId = await getGroupId();
+  await api(`/v1/groups/${groupId}/roster/members/${memberId}`, { method: 'DELETE' });
+}
+
 // Kalenderdaten kommen als YYYY-MM-DD in der Serverzeitzone der Gruppe; unsere
 // Abmeldungen liegen im selben Format vor, ein Stringvergleich genügt daher.
 async function getEventsInRange(isoStart: string, isoEnd: string): Promise<CalendarEvent[]> {

@@ -10,6 +10,8 @@
 // Discord-Konto einem Roster-Mitglied zuordnen lässt: laut OpenAPI-Spec taucht
 // discordUserId nur in der Readiness-Antwort auf, nicht im Roster-Export.
 
+export {}; // erzwingt Modul-Scope, sonst kollidieren die Top-Level-Namen mit anderen Skripten in src/scripts
+
 const env = process.env.NODE_ENV ?? 'development';
 const envFile = env === 'production' ? '.env.prod' : '.env.dev';
 require('dotenv').config({ path: envFile });

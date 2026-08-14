@@ -17,6 +17,7 @@ import {
 } from 'discord.js';
 import { sb } from '../../lib/supabase';
 import * as wowutils from '../../lib/wowutils';
+import { findOrCreateMember, Member } from '../../lib/members';
 
 const pending = new Map<string, Record<string, unknown>>();
 
@@ -91,34 +92,6 @@ function parsePrelim(s: string): boolean {
 }
 
 // --- Supabase helpers ---
-
-interface Member {
-  id: string;
-  wowutils_member_id: string | null;
-}
-
-// Sucht primär über die unveränderliche Discord-User-ID. Ältere Datensätze
-// haben noch keine discord_id; die werden über den Namen gefunden und dabei
-// nachgetragen.
-async function findOrCreateMember(user: { id: string; username: string }): Promise<Member> {
-  const columns = 'id, wowutils_member_id';
-
-  const { data: byId, error: idErr } = await sb.from('members').select(columns).eq('discord_id', user.id).maybeSingle();
-  if (idErr) { console.error('[abmeldungen] members select by discord_id error:', idErr); throw idErr; }
-  if (byId) return byId;
-
-  const { data: byName, error: nameErr } = await sb.from('members').select(columns).eq('discord_name', user.username).is('discord_id', null).maybeSingle();
-  if (nameErr) { console.error('[abmeldungen] members select by discord_name error:', nameErr); throw nameErr; }
-  if (byName) {
-    const { error: backfillErr } = await sb.from('members').update({ discord_id: user.id }).eq('id', byName.id);
-    if (backfillErr) console.error('[abmeldungen] members discord_id backfill error:', backfillErr);
-    return byName;
-  }
-
-  const { data: created, error: insertErr } = await sb.from('members').insert({ name: user.username, discord_name: user.username, discord_id: user.id }).select(columns).single();
-  if (insertErr) { console.error('[abmeldungen] members insert error:', insertErr); throw insertErr; }
-  return created;
-}
 
 // --- WoWUtils-Kalender ---
 

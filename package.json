@@ -10,7 +10,8 @@
     "deploy:dev": "NODE_ENV=development tsx src/deploy-commands.ts",
     "deploy:prod": "NODE_ENV=production tsx src/deploy-commands.ts",
     "probe:wowutils": "NODE_ENV=development tsx src/scripts/wowutils-probe.ts",
-    "seed:wowutils": "NODE_ENV=development tsx src/scripts/wowutils-seed-mapping.ts"
+    "seed:wowutils": "NODE_ENV=development tsx src/scripts/wowutils-seed-mapping.ts",
+    "probe:discord": "NODE_ENV=development tsx src/scripts/discord-probe.ts"
   },
   "keywords": [],
   "author": "",
