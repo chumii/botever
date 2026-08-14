@@ -1,4 +1,4 @@
-import { Events, Interaction } from 'discord.js';
+import { Events, Interaction, InteractionReplyOptions, MessageFlags } from 'discord.js';
 import { BotClient } from '../types';
 
 module.exports = {
@@ -13,7 +13,7 @@ module.exports = {
         await command.execute(interaction);
       } catch (error) {
         console.error(error);
-        const msg = { content: 'Fehler beim Ausführen des Commands.', ephemeral: true };
+        const msg: InteractionReplyOptions = { content: 'Fehler beim Ausführen des Commands.', flags: MessageFlags.Ephemeral };
         if (interaction.replied || interaction.deferred) await interaction.followUp(msg);
         else await interaction.reply(msg);
       }

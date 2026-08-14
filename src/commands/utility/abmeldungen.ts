@@ -12,10 +12,49 @@ import {
   ModalSubmitInteraction,
   StringSelectMenuInteraction,
   Client,
+  MessageFlags,
+  RepliableInteraction,
 } from 'discord.js';
 import { sb } from '../../lib/supabase';
 
 const pending = new Map<string, Record<string, unknown>>();
+
+// --- Ephemere Nachrichten aufräumen ---
+
+// Jeder Schritt des Dialogs erzeugt eine eigene ephemere Nachricht; Discord
+// blendet die vorherigen nicht aus, sodass sich der Channel mit veralteten
+// Panels füllt. Deshalb merken wir uns pro Nutzer die Interaktion, die die
+// aktuell sichtbare Nachricht erzeugt hat, und löschen sie, sobald die nächste
+// entsteht. Nur die neueste bleibt stehen.
+const activePanel = new Map<string, RepliableInteraction>();
+
+interface PanelPayload {
+  content: string;
+  components?: ActionRowBuilder<ButtonBuilder>[] | ActionRowBuilder<StringSelectMenuBuilder>[];
+}
+
+async function replacePanel(interaction: RepliableInteraction, payload: PanelPayload): Promise<void> {
+  const previous = activePanel.get(interaction.user.id);
+  activePanel.set(interaction.user.id, interaction);
+
+  // Erst die neue Nachricht senden, dann die alte entfernen — andersherum
+  // flackert der Dialog kurz weg.
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ components: [], ...payload });
+  } else {
+    await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+  }
+
+  if (!previous || previous.id === interaction.id) return;
+  try {
+    await previous.deleteReply();
+  } catch (e) {
+    // Interaction-Tokens leben 15 Minuten; danach ist die alte Nachricht nicht
+    // mehr löschbar und bleibt einfach stehen. Auch schon manuell entfernte
+    // Nachrichten landen hier.
+    console.debug('[abmeldungen] altes Panel nicht löschbar:', (e as Error).message);
+  }
+}
 
 // --- Date helpers ---
 
@@ -35,6 +74,11 @@ function parseGermanDate(s: string): string {
   return `${rawYear}-${month}-${day}`;
 }
 
+function todayIso(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
 function isoToGerman(iso: string): string {
   const [y, m, d] = iso.split('-');
   return `${d}.${m}.${y}`;
@@ -47,13 +91,38 @@ function parsePrelim(s: string): boolean {
 
 // --- Supabase helpers ---
 
-async function findOrCreateMember(discordName: string): Promise<string> {
-  const { data: found, error: findErr } = await sb.from('members').select('id').eq('discord_name', discordName).maybeSingle();
-  if (findErr) { console.error('[abmeldungen] members select error:', findErr); throw findErr; }
-  if (found) return found.id;
-  const { data: created, error: insertErr } = await sb.from('members').insert({ name: discordName, discord_name: discordName }).select('id').single();
+// Sucht primär über die unveränderliche Discord-User-ID. Ältere Datensätze
+// haben noch keine discord_id; die werden über den Namen gefunden und dabei
+// nachgetragen.
+async function findOrCreateMember(user: { id: string; username: string }): Promise<string> {
+  const { data: byId, error: idErr } = await sb.from('members').select('id').eq('discord_id', user.id).maybeSingle();
+  if (idErr) { console.error('[abmeldungen] members select by discord_id error:', idErr); throw idErr; }
+  if (byId) return byId.id;
+
+  const { data: byName, error: nameErr } = await sb.from('members').select('id').eq('discord_name', user.username).is('discord_id', null).maybeSingle();
+  if (nameErr) { console.error('[abmeldungen] members select by discord_name error:', nameErr); throw nameErr; }
+  if (byName) {
+    const { error: backfillErr } = await sb.from('members').update({ discord_id: user.id }).eq('id', byName.id);
+    if (backfillErr) console.error('[abmeldungen] members discord_id backfill error:', backfillErr);
+    return byName.id;
+  }
+
+  const { data: created, error: insertErr } = await sb.from('members').insert({ name: user.username, discord_name: user.username, discord_id: user.id }).select('id').single();
   if (insertErr) { console.error('[abmeldungen] members insert error:', insertErr); throw insertErr; }
   return created.id;
+}
+
+// Zwei Zeiträume überlappen, wenn jeder vor dem Ende des anderen beginnt.
+// Beide Grenzen sind inklusiv. exceptId klammert beim Bearbeiten den Eintrag
+// aus, der gerade geändert wird — sonst kollidiert er mit sich selbst.
+async function findOverlap(memberId: string, isoStart: string, isoEnd: string, exceptId?: string) {
+  // Endgültige Einträge zuerst: sie blockieren, vorläufige lösen nur eine
+  // Warnung aus. Bei mehreren Treffern soll also der strengere gewinnen.
+  let query = sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('member_id', memberId).lte('start_date', isoEnd).gte('end_date', isoStart);
+  if (exceptId) query = query.neq('id', exceptId);
+  const { data, error } = await query.order('is_preliminary').order('start_date').limit(1);
+  if (error) { console.error('[abmeldungen] overlap check error:', error); throw error; }
+  return data?.[0] ?? null;
 }
 
 async function postLog(client: Client, action: 'create' | 'edit' | 'delete', user: { id: string }, entry: { start_date: string; end_date: string; note?: string | null; is_preliminary?: boolean }) {
@@ -127,7 +196,7 @@ module.exports = {
       new ButtonBuilder().setCustomId('abmeldungen-new').setLabel('➕ Neue Abmeldung').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('abmeldungen-manage').setLabel('📋 Meine Abmeldungen').setStyle(ButtonStyle.Secondary),
     );
-    await interaction.reply({ content: 'Was möchtest du tun?', components: [row], ephemeral: true });
+    await replacePanel(interaction, { content: 'Was möchtest du tun?', components: [row] });
   },
 
   async buttonHandler(interaction: ButtonInteraction) {
@@ -142,11 +211,13 @@ module.exports = {
       await interaction.showModal(buildCreateModal((pending.get(interaction.user.id) ?? {}) as Record<string, string>));
 
     } else if (action === 'manage') {
-      await interaction.deferReply({ ephemeral: true });
-      const memberId = await findOrCreateMember(interaction.user.username);
-      const { data: entries } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('member_id', memberId).order('start_date');
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const memberId = await findOrCreateMember(interaction.user);
+      // Nur laufende und kommende Abmeldungen — abgelaufene würden das auf 25
+      // Optionen begrenzte Select-Menü mit der Zeit vollständig zulaufen lassen.
+      const { data: entries } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('member_id', memberId).gte('end_date', todayIso()).order('start_date');
       if (!entries || entries.length === 0) {
-        await interaction.editReply({ content: 'Du hast keine Abmeldungen eingetragen.', components: [] });
+        await replacePanel(interaction, { content: 'Du hast keine laufenden oder kommenden Abmeldungen eingetragen.' });
         return;
       }
       const options = entries.slice(0, 25).map((e: { id: string; start_date: string; end_date: string; note?: string | null }) => ({
@@ -155,11 +226,11 @@ module.exports = {
       }));
       const select = new StringSelectMenuBuilder().setCustomId('abmeldungen-pick').setPlaceholder('Abmeldung auswählen…').addOptions(options);
       const overflow = entries.length > 25 ? `\n_Nur die ersten 25 von ${entries.length} Einträgen._` : '';
-      await interaction.editReply({ content: `Deine Abmeldungen:${overflow}`, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)] });
+      await replacePanel(interaction, { content: `Deine Abmeldungen:${overflow}`, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)] });
 
     } else if (action === 'edit' && entryId) {
       const { data: entry } = await sb.from('vacations').select('start_date, end_date, note, is_preliminary').eq('id', entryId).single();
-      if (!entry) { await interaction.reply({ content: 'Eintrag nicht gefunden.', ephemeral: true }); return; }
+      if (!entry) { await replacePanel(interaction, { content: 'Eintrag nicht gefunden.' }); return; }
       await interaction.showModal(buildEditModal(entryId, {
         rawStart: isoToGerman(entry.start_date),
         rawEnd: isoToGerman(entry.end_date),
@@ -175,59 +246,87 @@ module.exports = {
         new ButtonBuilder().setCustomId(`abmeldungen-delyes-${entryId}`).setLabel('🗑️ Ja, löschen').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId('abmeldungen-delno').setLabel('Abbrechen').setStyle(ButtonStyle.Secondary),
       );
-      await interaction.reply({ content: 'Diese Abmeldung wirklich löschen?', components: [row], ephemeral: true });
+      await replacePanel(interaction, { content: 'Diese Abmeldung wirklich löschen?', components: [row] });
 
     } else if (action === 'delyes' && entryId) {
-      await interaction.deferReply({ ephemeral: true });
-      const memberId = await findOrCreateMember(interaction.user.username);
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const memberId = await findOrCreateMember(interaction.user);
       const { data: entry } = await sb.from('vacations').select('*').eq('id', entryId).eq('member_id', memberId).maybeSingle();
-      if (!entry) { await interaction.editReply({ content: 'Eintrag nicht gefunden oder nicht dein Eintrag.', components: [] }); return; }
+      if (!entry) { await replacePanel(interaction, { content: 'Eintrag nicht gefunden oder nicht dein Eintrag.' }); return; }
       await sb.from('vacations').delete().eq('id', entryId);
       await postLog(interaction.client, 'delete', interaction.user, entry);
-      await interaction.editReply({ content: `🗑️ Abmeldung **${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}** gelöscht.`, components: [] });
+      await replacePanel(interaction, { content: `🗑️ Abmeldung **${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}** gelöscht.` });
 
     } else if (action === 'delno') {
-      await interaction.reply({ content: 'Abgebrochen.', ephemeral: true });
+      await replacePanel(interaction, { content: 'Abgebrochen.' });
 
-    } else if (action === 'confirm') {
+    // 'force' überspringt die Überschneidungsprüfung — erreichbar nur über den
+    // Button, den die Warnung bei einer vorläufigen Kollision anbietet.
+    } else if (action === 'confirm' || action === 'force') {
       const p = pending.get(interaction.user.id);
-      if (!p) { await interaction.reply({ content: 'Nichts zum Bestätigen — bitte `/abmeldungen` neu starten.', ephemeral: true }); return; }
-      await interaction.deferReply({ ephemeral: true });
-      const memberId = await findOrCreateMember(interaction.user.username);
+      if (!p) { await replacePanel(interaction, { content: 'Nichts zum Bestätigen — bitte `/abmeldungen` neu starten.' }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const memberId = await findOrCreateMember(interaction.user);
+
+      if (action === 'confirm') {
+        const clash = await findOverlap(memberId, p.isoStart as string, p.isoEnd as string, (p.id as string | null) ?? undefined);
+        if (clash) {
+          const retryId = p.action === 'create' ? 'abmeldungen-retrynew' : `abmeldungen-retryedit-${p.id}`;
+          const retryButton = new ButtonBuilder().setCustomId(retryId).setLabel('✏️ Erneut eingeben').setStyle(ButtonStyle.Primary);
+          const clashLabel = `**${isoToGerman(clash.start_date)} – ${isoToGerman(clash.end_date)}**${clash.note ? ` · ${clash.note}` : ''}`;
+
+          if (clash.is_preliminary) {
+            await replacePanel(interaction, {
+              content: `⚠️ Überschneidet sich mit deiner _vorläufigen_ Abmeldung ${clashLabel}.\nDu kannst trotzdem speichern.`,
+              components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder().setCustomId('abmeldungen-force').setLabel('✅ Trotzdem speichern').setStyle(ButtonStyle.Success),
+                retryButton,
+              )],
+            });
+            return;
+          }
+
+          await replacePanel(interaction, {
+            content: `⚠️ Überschneidet sich mit deiner Abmeldung ${clashLabel}.\nBitte den Zeitraum anpassen oder die bestehende Abmeldung bearbeiten.`,
+            components: [new ActionRowBuilder<ButtonBuilder>().addComponents(retryButton)],
+          });
+          return;
+        }
+      }
 
       if (p.action === 'create') {
         const { data: inserted } = await sb.from('vacations').insert({ member_id: memberId, start_date: p.isoStart, end_date: p.isoEnd, note: p.note, is_preliminary: p.is_preliminary }).select('*').single();
         pending.delete(interaction.user.id);
         await postLog(interaction.client, 'create', interaction.user, inserted);
-        await interaction.editReply({ content: `✅ Abmeldung **${isoToGerman(inserted.start_date)} – ${isoToGerman(inserted.end_date)}** eingetragen.`, components: [] });
+        await replacePanel(interaction, { content: `✅ Abmeldung **${isoToGerman(inserted.start_date)} – ${isoToGerman(inserted.end_date)}** eingetragen.` });
 
       } else if (p.action === 'edit') {
         const { data: existing } = await sb.from('vacations').select('id').eq('id', p.id).eq('member_id', memberId).maybeSingle();
-        if (!existing) { pending.delete(interaction.user.id); await interaction.editReply({ content: 'Eintrag nicht gefunden oder nicht dein Eintrag.', components: [] }); return; }
+        if (!existing) { pending.delete(interaction.user.id); await replacePanel(interaction, { content: 'Eintrag nicht gefunden oder nicht dein Eintrag.' }); return; }
         const { data: updated } = await sb.from('vacations').update({ start_date: p.isoStart, end_date: p.isoEnd, note: p.note, is_preliminary: p.is_preliminary }).eq('id', p.id).select('*').single();
         pending.delete(interaction.user.id);
         await postLog(interaction.client, 'edit', interaction.user, updated);
-        await interaction.editReply({ content: `✅ Abmeldung aktualisiert: **${isoToGerman(updated.start_date)} – ${isoToGerman(updated.end_date)}**.`, components: [] });
+        await replacePanel(interaction, { content: `✅ Abmeldung aktualisiert: **${isoToGerman(updated.start_date)} – ${isoToGerman(updated.end_date)}**.` });
       }
 
     } else if (action === 'cancel') {
       pending.delete(interaction.user.id);
-      await interaction.reply({ content: 'Abgebrochen.', ephemeral: true });
+      await replacePanel(interaction, { content: 'Abgebrochen.' });
     }
   },
 
   async selectionHandler(interaction: StringSelectMenuInteraction) {
     const entryId = interaction.values[0];
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const { data: entry } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('id', entryId).single();
-    if (!entry) { await interaction.editReply({ content: 'Eintrag nicht gefunden.', components: [] }); return; }
+    if (!entry) { await replacePanel(interaction, { content: 'Eintrag nicht gefunden.' }); return; }
     const note = entry.note ? ` · ${entry.note}` : '';
     const prelim = entry.is_preliminary ? ' · _vorläufig_' : '';
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`abmeldungen-edit-${entry.id}`).setLabel('✏️ Ändern').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`abmeldungen-del-${entry.id}`).setLabel('🗑️ Löschen').setStyle(ButtonStyle.Danger),
     );
-    await interaction.editReply({ content: `**${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}**${note}${prelim}`, components: [row] });
+    await replacePanel(interaction, { content: `**${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}**${note}${prelim}`, components: [row] });
   },
 
   async modalHandler(interaction: ModalSubmitInteraction) {
@@ -260,22 +359,20 @@ module.exports = {
 
     if (parseError) {
       const retryId = modalAction === 'new' ? 'abmeldungen-retrynew' : `abmeldungen-retryedit-${entryId}`;
-      await interaction.reply({
+      await replacePanel(interaction, {
         content: `⚠️ ${parseError}`,
         components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId(retryId).setLabel('✏️ Erneut eingeben').setStyle(ButtonStyle.Primary),
         )],
-        ephemeral: true,
       });
       return;
     }
 
     const note = rawNote.trim() ? ` · ${rawNote.trim()}` : '';
     const prelim = parsePrelim(rawPrelim) ? ' · _vorläufig_' : '';
-    await interaction.reply({
+    await replacePanel(interaction, {
       content: `Abmeldung bestätigen?\n**${isoToGerman(isoStart!)} – ${isoToGerman(isoEnd!)}**${note}${prelim}`,
       components: [confirmRow()],
-      ephemeral: true,
     });
   },
 };
