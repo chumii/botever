@@ -16,6 +16,7 @@ import {
   RepliableInteraction,
 } from 'discord.js';
 import { sb } from '../../lib/supabase';
+import * as wowutils from '../../lib/wowutils';
 
 const pending = new Map<string, Record<string, unknown>>();
 
@@ -91,25 +92,62 @@ function parsePrelim(s: string): boolean {
 
 // --- Supabase helpers ---
 
+interface Member {
+  id: string;
+  wowutils_member_id: string | null;
+}
+
 // Sucht primär über die unveränderliche Discord-User-ID. Ältere Datensätze
 // haben noch keine discord_id; die werden über den Namen gefunden und dabei
 // nachgetragen.
-async function findOrCreateMember(user: { id: string; username: string }): Promise<string> {
-  const { data: byId, error: idErr } = await sb.from('members').select('id').eq('discord_id', user.id).maybeSingle();
-  if (idErr) { console.error('[abmeldungen] members select by discord_id error:', idErr); throw idErr; }
-  if (byId) return byId.id;
+async function findOrCreateMember(user: { id: string; username: string }): Promise<Member> {
+  const columns = 'id, wowutils_member_id';
 
-  const { data: byName, error: nameErr } = await sb.from('members').select('id').eq('discord_name', user.username).is('discord_id', null).maybeSingle();
+  const { data: byId, error: idErr } = await sb.from('members').select(columns).eq('discord_id', user.id).maybeSingle();
+  if (idErr) { console.error('[abmeldungen] members select by discord_id error:', idErr); throw idErr; }
+  if (byId) return byId;
+
+  const { data: byName, error: nameErr } = await sb.from('members').select(columns).eq('discord_name', user.username).is('discord_id', null).maybeSingle();
   if (nameErr) { console.error('[abmeldungen] members select by discord_name error:', nameErr); throw nameErr; }
   if (byName) {
     const { error: backfillErr } = await sb.from('members').update({ discord_id: user.id }).eq('id', byName.id);
     if (backfillErr) console.error('[abmeldungen] members discord_id backfill error:', backfillErr);
-    return byName.id;
+    return byName;
   }
 
-  const { data: created, error: insertErr } = await sb.from('members').insert({ name: user.username, discord_name: user.username, discord_id: user.id }).select('id').single();
+  const { data: created, error: insertErr } = await sb.from('members').insert({ name: user.username, discord_name: user.username, discord_id: user.id }).select(columns).single();
   if (insertErr) { console.error('[abmeldungen] members insert error:', insertErr); throw insertErr; }
-  return created.id;
+  return created;
+}
+
+// --- WoWUtils-Kalender ---
+
+// Der Abgleich ist Beiwerk: schlägt er fehl, ist die Abmeldung trotzdem
+// gespeichert. Deshalb wird hier nie geworfen, sondern eine Zeile zurückgegeben,
+// die unter die Bestätigung gehängt wird. Leerer String heisst "nichts zu sagen".
+async function syncCalendar(member: Member, jobs: { action: 'apply' | 'clear'; start: string; end: string }[]): Promise<string> {
+  if (!wowutils.isConfigured() || jobs.length === 0) return '';
+  if (!member.wowutils_member_id) {
+    return '\n📅 _Nicht mit WoWUtils verknüpft — der Kalender wurde nicht angepasst. Über `/abmeldungen` → „WoWUtils verknüpfen" nachholen._';
+  }
+
+  let changed = 0, failed = 0;
+  try {
+    for (const job of jobs) {
+      const run = job.action === 'apply' ? wowutils.applyAbsence : wowutils.clearAbsence;
+      const result = await run(member.wowutils_member_id, job.start, job.end);
+      changed += result.changed;
+      failed += result.failed;
+    }
+  } catch (e) {
+    console.error('[abmeldungen] WoWUtils-Abgleich fehlgeschlagen:', e);
+    return `\n📅 ⚠️ _Kalender-Abgleich fehlgeschlagen: ${(e as Error).message}_`;
+  }
+
+  if (changed === 0 && failed === 0) return '\n📅 _Keine Kalender-Termine im Zeitraum betroffen._';
+  const parts = [`${changed} Termin${changed === 1 ? '' : 'e'} im WoWUtils-Kalender angepasst`];
+  if (failed) parts.push(`${failed} fehlgeschlagen`);
+  return `\n📅 _${parts.join(', ')}._`;
 }
 
 // Zwei Zeiträume überlappen, wenn jeder vor dem Ende des anderen beginnt.
@@ -192,10 +230,22 @@ module.exports = {
     .setDescription('Abmeldungen (AFK/Urlaub) verwalten'),
 
   async execute(interaction: ChatInputCommandInteraction) {
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    const buttons = [
       new ButtonBuilder().setCustomId('abmeldungen-new').setLabel('➕ Neue Abmeldung').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('abmeldungen-manage').setLabel('📋 Meine Abmeldungen').setStyle(ButtonStyle.Secondary),
-    );
+    ];
+
+    // Nur anbieten, wenn noch keine Verknüpfung besteht — wer bereits verknüpft
+    // ist, sieht den Button nicht mehr. Eine falsche Verknüpfung lässt sich
+    // dadurch aktuell nur über Supabase korrigieren, nicht mehr per Button.
+    if (wowutils.isConfigured()) {
+      const member = await findOrCreateMember(interaction.user);
+      if (!member.wowutils_member_id) {
+        buttons.push(new ButtonBuilder().setCustomId('abmeldungen-link').setLabel('🔗 WoWUtils verknüpfen').setStyle(ButtonStyle.Secondary));
+      }
+    }
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
     await replacePanel(interaction, { content: 'Was möchtest du tun?', components: [row] });
   },
 
@@ -212,10 +262,10 @@ module.exports = {
 
     } else if (action === 'manage') {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const memberId = await findOrCreateMember(interaction.user);
+      const member = await findOrCreateMember(interaction.user);
       // Nur laufende und kommende Abmeldungen — abgelaufene würden das auf 25
       // Optionen begrenzte Select-Menü mit der Zeit vollständig zulaufen lassen.
-      const { data: entries } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('member_id', memberId).gte('end_date', todayIso()).order('start_date');
+      const { data: entries } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('member_id', member.id).gte('end_date', todayIso()).order('start_date');
       if (!entries || entries.length === 0) {
         await replacePanel(interaction, { content: 'Du hast keine laufenden oder kommenden Abmeldungen eingetragen.' });
         return;
@@ -250,12 +300,45 @@ module.exports = {
 
     } else if (action === 'delyes' && entryId) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const memberId = await findOrCreateMember(interaction.user);
-      const { data: entry } = await sb.from('vacations').select('*').eq('id', entryId).eq('member_id', memberId).maybeSingle();
+      const member = await findOrCreateMember(interaction.user);
+      const { data: entry } = await sb.from('vacations').select('*').eq('id', entryId).eq('member_id', member.id).maybeSingle();
       if (!entry) { await replacePanel(interaction, { content: 'Eintrag nicht gefunden oder nicht dein Eintrag.' }); return; }
       await sb.from('vacations').delete().eq('id', entryId);
       await postLog(interaction.client, 'delete', interaction.user, entry);
-      await replacePanel(interaction, { content: `🗑️ Abmeldung **${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}** gelöscht.` });
+      const cleared = await syncCalendar(member, entry.is_preliminary ? [] : [{ action: 'clear', start: entry.start_date, end: entry.end_date }]);
+      await replacePanel(interaction, { content: `🗑️ Abmeldung **${isoToGerman(entry.start_date)} – ${isoToGerman(entry.end_date)}** gelöscht.${cleared}` });
+
+    } else if (action === 'link') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (!wowutils.isConfigured()) {
+        await replacePanel(interaction, { content: 'Die WoWUtils-Anbindung ist nicht konfiguriert.' });
+        return;
+      }
+      const member = await findOrCreateMember(interaction.user);
+      const roster = await wowutils.getRoster();
+
+      // Ein Select-Menü fasst 25 Optionen, der Roster ist grösser. Discord
+      // erlaubt bis zu fünf Zeilen, also den Roster darauf verteilen.
+      const chunks: wowutils.RosterMember[][] = [];
+      for (let i = 0; i < roster.length && chunks.length < 5; i += 25) chunks.push(roster.slice(i, i + 25));
+
+      const rows = chunks.map((chunk, index) => new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`abmeldungen-linkpick-${index}`)
+          .setPlaceholder(`${chunk[0].displayName} – ${chunk[chunk.length - 1].displayName}`)
+          .addOptions(chunk.map(m => ({
+            label: m.displayName.slice(0, 100),
+            description: (m.characters[0] ? m.characters[0].name : m.battletag ?? '').slice(0, 100) || undefined,
+            value: m.memberId,
+            default: m.memberId === member.wowutils_member_id,
+          }))),
+      ));
+
+      const current = member.wowutils_member_id
+        ? roster.find(m => m.memberId === member.wowutils_member_id)?.displayName ?? member.wowutils_member_id
+        : null;
+      const intro = current ? `Aktuell verknüpft mit **${current}**. Auswahl ändern:` : 'Wer bist du im WoWUtils-Roster?';
+      await replacePanel(interaction, { content: intro, components: rows });
 
     } else if (action === 'delno') {
       await replacePanel(interaction, { content: 'Abgebrochen.' });
@@ -266,10 +349,10 @@ module.exports = {
       const p = pending.get(interaction.user.id);
       if (!p) { await replacePanel(interaction, { content: 'Nichts zum Bestätigen — bitte `/abmeldungen` neu starten.' }); return; }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const memberId = await findOrCreateMember(interaction.user);
+      const member = await findOrCreateMember(interaction.user);
 
       if (action === 'confirm') {
-        const clash = await findOverlap(memberId, p.isoStart as string, p.isoEnd as string, (p.id as string | null) ?? undefined);
+        const clash = await findOverlap(member.id, p.isoStart as string, p.isoEnd as string, (p.id as string | null) ?? undefined);
         if (clash) {
           const retryId = p.action === 'create' ? 'abmeldungen-retrynew' : `abmeldungen-retryedit-${p.id}`;
           const retryButton = new ButtonBuilder().setCustomId(retryId).setLabel('✏️ Erneut eingeben').setStyle(ButtonStyle.Primary);
@@ -295,18 +378,27 @@ module.exports = {
       }
 
       if (p.action === 'create') {
-        const { data: inserted } = await sb.from('vacations').insert({ member_id: memberId, start_date: p.isoStart, end_date: p.isoEnd, note: p.note, is_preliminary: p.is_preliminary }).select('*').single();
+        const { data: inserted } = await sb.from('vacations').insert({ member_id: member.id, start_date: p.isoStart, end_date: p.isoEnd, note: p.note, is_preliminary: p.is_preliminary }).select('*').single();
         pending.delete(interaction.user.id);
         await postLog(interaction.client, 'create', interaction.user, inserted);
-        await replacePanel(interaction, { content: `✅ Abmeldung **${isoToGerman(inserted.start_date)} – ${isoToGerman(inserted.end_date)}** eingetragen.` });
+        const applied = await syncCalendar(member, inserted.is_preliminary ? [] : [{ action: 'apply', start: inserted.start_date, end: inserted.end_date }]);
+        await replacePanel(interaction, { content: `✅ Abmeldung **${isoToGerman(inserted.start_date)} – ${isoToGerman(inserted.end_date)}** eingetragen.${applied}` });
 
       } else if (p.action === 'edit') {
-        const { data: existing } = await sb.from('vacations').select('id').eq('id', p.id).eq('member_id', memberId).maybeSingle();
-        if (!existing) { pending.delete(interaction.user.id); await replacePanel(interaction, { content: 'Eintrag nicht gefunden oder nicht dein Eintrag.' }); return; }
+        const { data: previous } = await sb.from('vacations').select('*').eq('id', p.id).eq('member_id', member.id).maybeSingle();
+        if (!previous) { pending.delete(interaction.user.id); await replacePanel(interaction, { content: 'Eintrag nicht gefunden oder nicht dein Eintrag.' }); return; }
         const { data: updated } = await sb.from('vacations').update({ start_date: p.isoStart, end_date: p.isoEnd, note: p.note, is_preliminary: p.is_preliminary }).eq('id', p.id).select('*').single();
         pending.delete(interaction.user.id);
         await postLog(interaction.client, 'edit', interaction.user, updated);
-        await replacePanel(interaction, { content: `✅ Abmeldung aktualisiert: **${isoToGerman(updated.start_date)} – ${isoToGerman(updated.end_date)}**.` });
+
+        // Erst den alten Zeitraum räumen, dann den neuen setzen. Das deckt auch
+        // den Wechsel zwischen vorläufig und endgültig ab, ohne Sonderfälle.
+        const jobs: { action: 'apply' | 'clear'; start: string; end: string }[] = [];
+        if (!previous.is_preliminary) jobs.push({ action: 'clear', start: previous.start_date, end: previous.end_date });
+        if (!updated.is_preliminary) jobs.push({ action: 'apply', start: updated.start_date, end: updated.end_date });
+        const synced = await syncCalendar(member, jobs);
+
+        await replacePanel(interaction, { content: `✅ Abmeldung aktualisiert: **${isoToGerman(updated.start_date)} – ${isoToGerman(updated.end_date)}**.${synced}` });
       }
 
     } else if (action === 'cancel') {
@@ -316,8 +408,33 @@ module.exports = {
   },
 
   async selectionHandler(interaction: StringSelectMenuInteraction) {
-    const entryId = interaction.values[0];
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (interaction.customId.startsWith('abmeldungen-linkpick')) {
+      const wowutilsMemberId = interaction.values[0];
+      const member = await findOrCreateMember(interaction.user);
+      const { error } = await sb.from('members').update({ wowutils_member_id: wowutilsMemberId }).eq('id', member.id);
+
+      if (error) {
+        // 23505 ist die Unique-Verletzung: der Roster-Eintrag hängt schon an
+        // einem anderen Discord-Konto.
+        const taken = error.code === '23505';
+        if (!taken) console.error('[abmeldungen] wowutils_member_id update error:', error);
+        await replacePanel(interaction, {
+          content: taken
+            ? '⚠️ Dieser Roster-Eintrag ist bereits mit einem anderen Discord-Konto verknüpft. Melde dich bei einem Officer.'
+            : '⚠️ Verknüpfen fehlgeschlagen.',
+        });
+        return;
+      }
+
+      const roster = await wowutils.getRoster();
+      const name = roster.find(m => m.memberId === wowutilsMemberId)?.displayName ?? wowutilsMemberId;
+      await replacePanel(interaction, { content: `🔗 Verknüpft mit **${name}**. Künftige Abmeldungen tragen sich im WoWUtils-Kalender ein.` });
+      return;
+    }
+
+    const entryId = interaction.values[0];
     const { data: entry } = await sb.from('vacations').select('id, start_date, end_date, note, is_preliminary').eq('id', entryId).single();
     if (!entry) { await replacePanel(interaction, { content: 'Eintrag nicht gefunden.' }); return; }
     const note = entry.note ? ` · ${entry.note}` : '';
