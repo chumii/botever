@@ -38,14 +38,14 @@ export const lfgMonitor: Monitor = {
 function isInMonitoredForum(thread: AnyThreadChannel): boolean {
   if (!thread.parent) return false;
   if (thread.parent.type !== ChannelType.GuildForum) return false;
-  const forumId = process.env.FORUM_SOURCE_CHANNEL;
+  const forumId = process.env.LFG_FORUM_SOURCE_CHANNEL;
   if (forumId && thread.parentId !== forumId) return false;
   return true;
 }
 
 async function announceThread(client: Client, thread: AnyThreadChannel) {
   try {
-    const channelId = process.env.FORUM_ANNOUNCE_CHANNEL ?? process.env.ANN_CHANNEL;
+    const channelId = process.env.LFG_FORUM_ANNOUNCE_CHANNEL ?? process.env.ANN_CHANNEL;
     if (!channelId) return;
     const channel = client.channels.cache.get(channelId) as TextBasedChannel | undefined;
     if (!channel || !('send' in channel)) return;
@@ -56,7 +56,7 @@ async function announceThread(client: Client, thread: AnyThreadChannel) {
 }
 
 function hasDoneTag(thread: AnyThreadChannel): boolean {
-  const tag = process.env.FORUM_DONE_TAG_NAME;
+  const tag = process.env.LFG_FORUM_DONE_TAG_NAME;
   if (!tag) return false;
   return hasTag(thread, tag);
 }
@@ -73,10 +73,10 @@ function hasTag(thread: AnyThreadChannel, tag: string): boolean {
 }
 
 async function isOlderThanConfigured(thread: AnyThreadChannel): Promise<boolean> {
-  const noDeleteTag = process.env.FORUM_NO_DELETE_TAG_NAME;
+  const noDeleteTag = process.env.LFG_FORUM_NO_DELETE_TAG_NAME;
   if (noDeleteTag && hasTag(thread, noDeleteTag)) return false;
 
-  const cleanupDays = Number(process.env.FORUM_CLEANUP_DAYS);
+  const cleanupDays = Number(process.env.LFG_FORUM_CLEANUP_DAYS);
   if (!Number.isFinite(cleanupDays) || cleanupDays <= 0) return false;
 
   let retentionDays = cleanupDays;
@@ -139,7 +139,7 @@ async function safeDelete(thread: AnyThreadChannel, reason: string) {
 
 async function performSweep(client: Client) {
   try {
-    const forumId = process.env.FORUM_SOURCE_CHANNEL;
+    const forumId = process.env.LFG_FORUM_SOURCE_CHANNEL;
     if (!forumId) return;
     const forum = await client.channels.fetch(forumId).catch(() => null);
     if (!forum || forum.type !== ChannelType.GuildForum) return;
