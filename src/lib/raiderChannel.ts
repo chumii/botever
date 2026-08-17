@@ -1,8 +1,5 @@
 import { Guild, ChannelType, PermissionFlagsBits, TextChannel, OverwriteType } from 'discord.js';
-
-// Text steht vorerst fest — kann später konfigurierbar werden, sobald es mehr
-// als eine feste Willkommensnachricht braucht.
-const WELCOME_MESSAGE = 'Hallo test';
+import { postWelcomeMessage } from './welcomeMessage';
 
 export function isConfigured(): boolean {
   return Boolean(process.env.RAIDER_CATEGORY_ID);
@@ -40,8 +37,7 @@ export async function createRaiderChannel(guild: Guild, channelName: string, rai
     permissionOverwrites: overwrites,
   });
 
-  const welcome = await channel.send(WELCOME_MESSAGE);
-  await welcome.pin();
+  await postWelcomeMessage(channel, true);
 
   return channel;
 }
