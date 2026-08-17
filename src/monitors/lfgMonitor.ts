@@ -1,5 +1,6 @@
 import { Client, Events, AnyThreadChannel, ChannelType, TextBasedChannel } from 'discord.js';
 import { Monitor } from '../types';
+import * as signup from '../lib/groupSignup';
 
 const pendingTagDeletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -9,6 +10,7 @@ export const lfgMonitor: Monitor = {
       try {
         if (!isInMonitoredForum(thread)) return;
         await announceThread(client, thread);
+        await postLfgSignup(thread);
         if (hasDoneTag(thread)) scheduleTagDeletion(thread);
         if (await isOlderThanConfigured(thread)) await safeDelete(thread, 'Auto-cleanup on create (age)');
       } catch (err) {
@@ -52,6 +54,29 @@ async function announceThread(client: Client, thread: AnyThreadChannel) {
     await channel.send(`https://discord.com/channels/${thread.guildId}/${thread.id}`);
   } catch (err) {
     console.error('lfgMonitor announce error:', err);
+  }
+}
+
+// Postet als erste Antwort im Thread eine /lfg-Anmeldung mit Standardgröße 5
+// und leerer Beschreibung. Der Thread-Ersteller wird zum Event-Ersteller —
+// hat also über die normale /lfg-Berechtigungslogik Schließen-/Löschen-Recht,
+// ganz ohne eigene Sonderbehandlung dafür nötig.
+async function postLfgSignup(thread: AnyThreadChannel) {
+  try {
+    if (!thread.ownerId || !thread.guild) return;
+    const eventId = await signup.createEvent({
+      guildId: thread.guildId,
+      channelId: thread.id,
+      creatorDiscordId: thread.ownerId,
+      size: 5,
+    });
+    const message = await signup.buildEventMessage(thread.guild, eventId);
+    if (!message) return;
+    const posted = await thread.send(message);
+    await signup.setEventMessage(eventId, posted.id);
+    await signup.addRoleReactions(posted);
+  } catch (err) {
+    console.error('lfgMonitor postLfgSignup error:', err);
   }
 }
 
