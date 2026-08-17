@@ -10,3 +10,8 @@ export function isOfficer(member: GuildMember): boolean {
   const ids = officerRoleIds();
   return ids.length > 0 && ids.some(id => member.roles.cache.has(id));
 }
+
+export function isRaiderOrOfficer(member: GuildMember): boolean {
+  const raiderRoleId = process.env.RAIDER_ROLE_ID;
+  return isOfficer(member) || Boolean(raiderRoleId && member.roles.cache.has(raiderRoleId));
+}
