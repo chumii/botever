@@ -108,6 +108,97 @@ export async function addRoleReactions(message: Message): Promise<void> {
   }
 }
 
+// --- Gruppen-Zusammensetzung ---
+
+// Formel gilt für Gruppengrößen bis 5: 1 Tank, 1 Heiler, der Rest DD. Für
+// größere Gruppen (Raid) macht eine feste Formel keinen Sinn mehr — dort
+// zeigt buildEventMessage stattdessen nur eine rohe Zählung pro Rolle.
+const COMPOSITION_MAX_SIZE = 5;
+
+type SlotKey = 'tank' | 'healer' | 'dd';
+
+// Welche Slots eine Rolle abdecken kann. Kombi-Rollen decken genau zwei ab,
+// "any" alle drei — aber jede Person kann trotzdem immer nur einen Slot
+// gleichzeitig füllen.
+const SLOT_COVERAGE: Record<RoleKey, SlotKey[]> = {
+  tank: ['tank'],
+  healer: ['healer'],
+  dd: ['dd'],
+  tank_healer: ['tank', 'healer'],
+  tank_dd: ['tank', 'dd'],
+  healer_dd: ['healer', 'dd'],
+  any: ['tank', 'healer', 'dd'],
+};
+
+interface Composition {
+  tank: boolean;
+  healer: boolean;
+  dd: number;
+  ddNeeded: number;
+}
+
+// Kuhn's Algorithmus (Augmenting-Path-Matching): jede Person wird versuchsweise
+// einem ihrer möglichen Slots zugeteilt; ist der schon belegt, wird rekursiv
+// versucht, die dort sitzende Person auf einen ANDEREN ihrer Slots umzuziehen,
+// um Platz zu machen. Nötig, weil eine einfache "wer hat diese Rolle"-Zählung
+// bei Kombi-Rollen falsche Ergebnisse liefert (siehe Szenario B3 im Mockup:
+// drei Tank/Heiler-Anmeldungen für nur zwei Slots — ohne echte Zuteilung
+// würde das fälschlich als "Tank ✅, Heiler ✅" durchgehen, obwohl eine
+// Person übrig bleibt, die keinen DD-Slot ersatzweise füllen kann).
+function computeComposition(confirmedRoles: RoleKey[], size: number): Composition | null {
+  if (size < 2) return null;
+  const ddNeeded = size - 2;
+  const capacity: Record<SlotKey, number> = { tank: 1, healer: 1, dd: ddNeeded };
+  const filledBy: Record<SlotKey, number[]> = { tank: [], healer: [], dd: [] };
+
+  function tryAssign(personIdx: number, visited: Set<SlotKey>): boolean {
+    for (const slot of SLOT_COVERAGE[confirmedRoles[personIdx]]) {
+      if (visited.has(slot)) continue;
+      visited.add(slot);
+      if (filledBy[slot].length < capacity[slot]) {
+        filledBy[slot].push(personIdx);
+        return true;
+      }
+      for (const otherIdx of filledBy[slot]) {
+        if (tryAssign(otherIdx, visited)) {
+          filledBy[slot] = filledBy[slot].filter(i => i !== otherIdx);
+          filledBy[slot].push(personIdx);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  for (let i = 0; i < confirmedRoles.length; i++) tryAssign(i, new Set());
+
+  return { tank: filledBy.tank.length > 0, healer: filledBy.healer.length > 0, dd: filledBy.dd.length, ddNeeded };
+}
+
+function compositionField(confirmedRoles: RoleKey[], size: number): { name: string; value: string } | null {
+  const comp = computeComposition(confirmedRoles, size);
+  if (!comp) return null;
+
+  const missing: string[] = [];
+  if (!comp.tank) missing.push('1 Tank');
+  if (!comp.healer) missing.push('1 Heiler');
+  if (comp.dd < comp.ddNeeded) missing.push(`${comp.ddNeeded - comp.dd} DD`);
+
+  const line = [
+    `${comp.tank ? '✅' : '❌'} Tank`,
+    `${comp.healer ? '✅' : '❌'} Heiler`,
+    `${comp.dd >= comp.ddNeeded ? '✅' : '❌'} DD (${comp.dd}/${comp.ddNeeded})`,
+  ].join('   ');
+  const value = missing.length ? `${line}\n⚠️ Es fehlt: ${missing.join(', ')}` : line;
+
+  return { name: 'Zusammensetzung', value };
+}
+
+function roleTallyField(confirmedRoles: RoleKey[]): { name: string; value: string } {
+  const value = ROLE_ORDER.map(r => `${ROLE_EMOJI[r]} ${confirmedRoles.filter(role => role === r).length}`).join('   ');
+  return { name: 'Rollen', value };
+}
+
 function adminButtons(eventId: string, closed: boolean): ActionRowBuilder<ButtonBuilder>[] {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`lfg-delete:${eventId}`).setLabel('Löschen').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
@@ -133,11 +224,16 @@ export async function buildEventMessage(guild: Guild, eventId: string): Promise<
 
   const confirmed = lines.slice(0, event.size);
   const waitlist = lines.slice(event.size);
+  const confirmedRoles = rows.slice(0, event.size).map(s => s.role);
 
   const embed = new EmbedBuilder()
     .setTitle(event.status === 'closed' ? '🔒 Anmeldung (geschlossen)' : '📋 Anmeldung')
     .addFields({ name: `✅ Angemeldet (${Math.min(rows.length, event.size)}/${event.size})`, value: confirmed.join('\n') || '_Noch niemand angemeldet_' });
   if (event.description) embed.setDescription(event.description);
+  if (confirmedRoles.length) {
+    const extra = event.size <= COMPOSITION_MAX_SIZE ? compositionField(confirmedRoles, event.size) : roleTallyField(confirmedRoles);
+    if (extra) embed.addFields(extra);
+  }
   if (waitlist.length) embed.addFields({ name: `⏳ Warteliste (${waitlist.length})`, value: waitlist.join('\n') });
   if (event.status === 'open') embed.setFooter({ text: ROLE_ORDER.map(r => `${ROLE_EMOJI[r]} ${ROLE_LABEL[r]}`).join('  ') });
 
