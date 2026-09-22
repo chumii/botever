@@ -38,6 +38,7 @@ interface EventRow {
   size: number;
   description: string | null;
   status: 'open' | 'closed';
+  message_id: string | null;
 }
 
 interface SignupRow {
@@ -64,8 +65,15 @@ export async function setEventMessage(eventId: string, messageId: string): Promi
 }
 
 export async function getEvent(eventId: string): Promise<EventRow | null> {
-  const { data } = await sb.from('group_events').select('id, creator_discord_id, size, description, status').eq('id', eventId).maybeSingle();
+  const { data } = await sb.from('group_events').select('id, creator_discord_id, size, description, status, message_id').eq('id', eventId).maybeSingle();
   return data;
+}
+
+/** Discord-User-IDs der Angemeldeten, aufgeteilt in bestätigte Plätze und Warteliste. */
+export async function getSignupUserIds(eventId: string, size: number): Promise<{ confirmed: string[]; waitlist: string[] }> {
+  const { data } = await sb.from('group_event_signups').select('discord_user_id').eq('event_id', eventId).order('signed_up_at');
+  const ids = (data ?? []).map(r => r.discord_user_id);
+  return { confirmed: ids.slice(0, size), waitlist: ids.slice(size) };
 }
 
 export async function getEventIdByMessageId(messageId: string): Promise<string | null> {
@@ -200,12 +208,25 @@ function roleTallyField(confirmedRoles: RoleKey[]): { name: string; value: strin
 }
 
 function adminButtons(eventId: string, closed: boolean): ActionRowBuilder<ButtonBuilder>[] {
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+
+  // Pingen ergibt bei einer geschlossenen Anmeldung keinen Sinn mehr, daher
+  // nur im offenen Zustand anbieten.
+  if (!closed) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`lfg-ping:${eventId}`).setLabel('Pingen').setEmoji('📢').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`lfg-ping-waitlist:${eventId}`).setLabel('Pingen inkl. Warteliste').setEmoji('📢').setStyle(ButtonStyle.Secondary),
+    ));
+  }
+
+  const adminRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`lfg-delete:${eventId}`).setLabel('Löschen').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
   );
-  if (closed) row.addComponents(new ButtonBuilder().setCustomId(`lfg-open:${eventId}`).setLabel('Wieder öffnen').setEmoji('🔓').setStyle(ButtonStyle.Success));
-  else row.addComponents(new ButtonBuilder().setCustomId(`lfg-close:${eventId}`).setLabel('Schließen').setEmoji('🔒').setStyle(ButtonStyle.Secondary));
-  return [row];
+  if (closed) adminRow.addComponents(new ButtonBuilder().setCustomId(`lfg-open:${eventId}`).setLabel('Wieder öffnen').setEmoji('🔓').setStyle(ButtonStyle.Success));
+  else adminRow.addComponents(new ButtonBuilder().setCustomId(`lfg-close:${eventId}`).setLabel('Schließen').setEmoji('🔒').setStyle(ButtonStyle.Secondary));
+  rows.push(adminRow);
+
+  return rows;
 }
 
 /** Baut Embed + Buttons für den aktuellen Stand. null, wenn das Event nicht mehr existiert. */
