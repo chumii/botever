@@ -9,6 +9,7 @@ import { BotClient, Command, Monitor } from './types';
 import { voiceMonitor } from './monitors/voiceMonitor';
 import { lfgMonitor } from './monitors/lfgMonitor';
 import { lfgSignupMonitor } from './monitors/lfgSignupMonitor';
+import { keepaliveMonitor } from './monitors/keepaliveMonitor';
 
 const client = new Client({
   intents: [
@@ -48,7 +49,7 @@ for (const file of readdirSync(eventsPath).filter(f => f.endsWith('.ts') || f.en
 }
 
 // Load monitors
-const monitors: Monitor[] = [voiceMonitor, lfgMonitor, lfgSignupMonitor];
+const monitors: Monitor[] = [voiceMonitor, lfgMonitor, lfgSignupMonitor, keepaliveMonitor];
 for (const monitor of monitors) {
   monitor.init(client);
 }
