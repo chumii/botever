@@ -56,5 +56,7 @@ for (const monitor of monitors) {
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) throw new Error(`DISCORD_TOKEN missing in ${envFile}`);
+// Der Supabase-Client ist lazy; ohne diesen Check fiele ein fehlender Key erst bei der ersten Abfrage auf.
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) throw new Error(`SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing in ${envFile}`);
 
 client.login(token);

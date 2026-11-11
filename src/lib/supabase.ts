@@ -13,8 +13,8 @@ let client: SupabaseClient | undefined;
 function realClient(): SupabaseClient {
   if (client) return client;
   const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY;
-  if (!url || !key) throw new Error('SUPABASE_URL oder SUPABASE_ANON_KEY fehlt in .env');
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL oder SUPABASE_SERVICE_ROLE_KEY fehlt in .env');
   client = createClient(url, key);
   return client;
 }
